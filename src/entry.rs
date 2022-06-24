@@ -5,7 +5,6 @@ use filetime::{self, FileTime};
 use std::{
     borrow::Cow,
     cmp,
-    collections::VecDeque,
     fmt,
     io::{Error, ErrorKind, SeekFrom},
     marker,
@@ -18,6 +17,7 @@ use tokio::{
     fs::OpenOptions,
     io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt},
 };
+use pin_project::pin_project;
 
 /// A read-only view into an entry of an archive.
 ///
@@ -39,6 +39,7 @@ impl<R: Read + Unpin> fmt::Debug for Entry<R> {
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
+#[pin_project]
 pub struct EntryFields<R: Read + Unpin> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
@@ -47,7 +48,7 @@ pub struct EntryFields<R: Read + Unpin> {
     pub size: u64,
     pub header_pos: u64,
     pub file_pos: u64,
-    pub data: VecDeque<EntryIo<R>>,
+    pub data: Vec<EntryIo<R>>,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_mtime: bool,
@@ -854,10 +855,15 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
         cx: &mut Context<'_>,
         into: &mut io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut this = self.get_mut();
+        let mut this = self.project();
         loop {
             if this.read_state.is_none() {
-                this.read_state = this.data.pop_front();
+                if this.data.is_empty() {
+                    *this.read_state = None;
+                } else {
+                    let data = &mut *this.data;
+                    *this.read_state = Some(data.remove(0));
+                }
             }
 
             if let Some(ref mut io) = &mut this.read_state {
@@ -865,7 +871,7 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
                 let ret = Pin::new(io).poll_read(cx, into);
                 match ret {
                     Poll::Ready(Ok(())) if into.filled().len() == start => {
-                        this.read_state = None;
+                        *this.read_state = None;
                         if this.data.is_empty() {
                             return Poll::Ready(Ok(()));
                         }

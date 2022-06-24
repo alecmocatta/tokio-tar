@@ -1,19 +1,19 @@
-use std::{
+use std::{convert::TryInto,
     cmp,
     collections::VecDeque,
     path::Path,
     pin::Pin,
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, Ordering},Mutex,
         Arc,
     },
     task::{Context, Poll},
 };
 use tokio::{
     io::{self, AsyncRead as Read, AsyncReadExt},
-    sync::Mutex,
 };
 use tokio_stream::*;
+use pin_project::pin_project;
 
 use crate::{
     entry::{EntryFields, EntryIo},
@@ -26,7 +26,7 @@ use crate::{
 /// This archive can have an entry added to it and it can be iterated over.
 #[derive(Debug)]
 pub struct Archive<R: Read + Unpin> {
-    inner: Arc<ArchiveInner<R>>,
+    inner: Arc<Mutex<ArchiveInner<R>>>,
 }
 
 impl<R: Read + Unpin> Clone for Archive<R> {
@@ -37,14 +37,16 @@ impl<R: Read + Unpin> Clone for Archive<R> {
     }
 }
 
+#[pin_project]
 #[derive(Debug)]
-pub struct ArchiveInner<R> {
-    pos: AtomicU64,
+pub struct ArchiveInner<R: Read + Unpin> {
+    pos: u64,
     unpack_xattrs: bool,
     preserve_permissions: bool,
     preserve_mtime: bool,
     ignore_zeros: bool,
-    obj: Mutex<R>,
+    #[pin]
+    obj: R,
 }
 
 /// Configure the archive.
@@ -119,14 +121,14 @@ impl<R: Read + Unpin> ArchiveBuilder<R> {
         } = self;
 
         Archive {
-            inner: Arc::new(ArchiveInner {
+            inner: Arc::new(Mutex::new(ArchiveInner {
                 unpack_xattrs,
                 preserve_permissions,
                 preserve_mtime,
                 ignore_zeros,
-                obj: Mutex::new(obj),
-                pos: 0.into(),
-            }),
+                obj,
+                pos: 0,
+            })),
         }
     }
 }
@@ -135,23 +137,21 @@ impl<R: Read + Unpin> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
-            inner: Arc::new(ArchiveInner {
+            inner: Arc::new(Mutex::new(ArchiveInner {
                 unpack_xattrs: false,
                 preserve_permissions: false,
                 preserve_mtime: true,
                 ignore_zeros: false,
-                obj: Mutex::new(obj),
-                pos: 0.into(),
-            }),
+                obj,
+                pos: 0,
+            })),
         }
     }
 
     /// Unwrap this archive, returning the underlying object.
     pub fn into_inner(self) -> Result<R, Self> {
-        let Self { inner } = self;
-
-        match Arc::try_unwrap(inner) {
-            Ok(inner) => Ok(inner.obj.into_inner()),
+        match Arc::try_unwrap(self.inner) {
+            Ok(inner) => Ok(inner.into_inner().unwrap().obj),
             Err(inner) => Err(Self { inner }),
         }
     }
@@ -162,8 +162,8 @@ impl<R: Read + Unpin> Archive<R> {
     /// sequence. If entries are processed out of sequence (from what the
     /// stream returns), then the contents read for each entry may be
     /// corrupted.
-    pub fn entries(&mut self) -> io::Result<Entries<R>> {
-        if self.inner.pos.load(Ordering::SeqCst) != 0 {
+    pub fn entries(self) -> io::Result<Entries<R>> {
+        if self.inner.lock().unwrap().pos != 0 {
             return Err(other(
                 "cannot call entries unless archive is at \
                  position 0",
@@ -171,8 +171,9 @@ impl<R: Read + Unpin> Archive<R> {
         }
 
         Ok(Entries {
-            archive: self.clone(),
+            archive: self,
             current: (0, None, 0, None),
+            fields: None,
             gnu_longlink: None,
             gnu_longname: None,
             pax_extensions: None,
@@ -185,8 +186,8 @@ impl<R: Read + Unpin> Archive<R> {
     /// sequence. If entries are processed out of sequence (from what the
     /// stream returns), then the contents read for each entry may be
     /// corrupted.
-    pub fn entries_raw(&mut self) -> io::Result<RawEntries<R>> {
-        if self.inner.pos.load(Ordering::SeqCst) != 0 {
+    pub fn entries_raw(self) -> io::Result<RawEntries<R>> {
+        if self.inner.lock().unwrap().pos != 0 {
             return Err(other(
                 "cannot call entries_raw unless archive is at \
                  position 0",
@@ -194,7 +195,7 @@ impl<R: Read + Unpin> Archive<R> {
         }
 
         Ok(RawEntries {
-            archive: self.clone(),
+            archive: self,
             current: (0, None, 0),
         })
     }
@@ -212,31 +213,63 @@ impl<R: Read + Unpin> Archive<R> {
     /// # Examples
     ///
     /// ```no_run
-    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { tokio::task::block_on(async {
     /// #
     /// use tokio::fs::File;
-    /// use tokio_tar::Archive;
+    /// use async_tar::Archive;
     ///
     /// let mut ar = Archive::new(File::open("foo.tar").await?);
     /// ar.unpack("foo").await?;
     /// #
     /// # Ok(()) }) }
     /// ```
-    pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
+    pub async fn unpack<P: AsRef<Path>>(self, dst: P) -> io::Result<()> {
         let mut entries = self.entries()?;
         let mut pinned = Pin::new(&mut entries);
+        let dst = dst.as_ref();
+
+        if tokio::fs::symlink_metadata(&dst).await.is_err() {
+            tokio::fs::create_dir_all(&dst)
+                .await
+                .map_err(|e| TarError::new(&format!("failed to create `{}`", dst.display()), e))?;
+        }
+
+        // Canonicalizing the dst directory will prepend the path with '\\?\'
+        // on windows which will allow windows APIs to treat the path as an
+        // extended-length path with a 32,767 character limit. Otherwise all
+        // unpacked paths over 260 characters will fail on creation with a
+        // NotFound exception.
+        let dst = tokio::fs::canonicalize(&dst)
+            .await
+            .unwrap_or_else(|_| dst.to_path_buf());
+
+        // Delay any directory entries until the end (they will be created if needed by
+        // descendants), to ensure that directory permissions do not interfer with descendant
+        // extraction.
+        let mut directories = Vec::new();
         while let Some(entry) = pinned.next().await {
             let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
-            file.unpack_in(dst.as_ref()).await?;
+            if file.header().entry_type() == crate::EntryType::Directory {
+                directories.push(file);
+            } else {
+                file.unpack_in(&dst).await?;
+            }
         }
+        for mut dir in directories {
+            dir.unpack_in(&dst).await?;
+        }
+
         Ok(())
     }
 }
 
 /// Stream of `Entry`s.
+#[pin_project]
+#[derive(Debug)]
 pub struct Entries<R: Read + Unpin> {
     archive: Archive<R>,
     current: (u64, Option<Header>, usize, Option<GnuExtSparseHeader>),
+    fields: Option<EntryFields<Archive<R>>>,
     gnu_longname: Option<Vec<u8>>,
     gnu_longlink: Option<Vec<u8>>,
     pax_extensions: Option<Vec<u8>>,
@@ -264,77 +297,78 @@ macro_rules! ready_err {
 impl<R: Read + Unpin> Stream for Entries<R> {
     type Item = io::Result<Entry<Archive<R>>>;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
         loop {
-            let archive = self.archive.clone();
-            let (next, current_header, current_header_pos, _) = &mut self.current;
-            let entry = ready_opt_err!(poll_next_raw(
-                archive,
-                next,
-                current_header,
-                current_header_pos,
-                cx
-            ));
+            let (next, current_header, current_header_pos, _) = &mut this.current;
+
+            let fields = if let Some(fields) = this.fields.as_mut() {
+                fields
+            } else {
+                *this.fields = Some(EntryFields::from(ready_opt_err!(poll_next_raw(
+                    this.archive,
+                    next,
+                    current_header,
+                    current_header_pos,
+                    cx
+                ))));
+                continue;
+            };
+
             let is_recognized_header =
-                entry.header().as_gnu().is_some() || entry.header().as_ustar().is_some();
-            if is_recognized_header && entry.header().entry_type().is_gnu_longname() {
-                if self.gnu_longname.is_some() {
+                fields.header.as_gnu().is_some() || fields.header.as_ustar().is_some();
+            if is_recognized_header && fields.header.entry_type().is_gnu_longname() {
+                if this.gnu_longname.is_some() {
                     return Poll::Ready(Some(Err(other(
                         "two long name entries describing \
                          the same member",
                     ))));
                 }
 
-                let mut ef = EntryFields::from(entry);
-                let val = ready_err!(Pin::new(&mut ef).poll_read_all(cx));
-                self.gnu_longname = Some(val);
+                *this.gnu_longname = Some(ready_err!(Pin::new(fields).poll_read_all(cx)));
+                *this.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_gnu_longlink() {
-                if self.gnu_longlink.is_some() {
+            if is_recognized_header && fields.header.entry_type().is_gnu_longlink() {
+                if this.gnu_longlink.is_some() {
                     return Poll::Ready(Some(Err(other(
                         "two long name entries describing \
                          the same member",
                     ))));
                 }
-                let mut ef = EntryFields::from(entry);
-                let val = ready_err!(Pin::new(&mut ef).poll_read_all(cx));
-                self.gnu_longlink = Some(val);
+                *this.gnu_longlink = Some(ready_err!(Pin::new(fields).poll_read_all(cx)));
+                *this.fields = None;
                 continue;
             }
 
-            if is_recognized_header && entry.header().entry_type().is_pax_local_extensions() {
-                if self.pax_extensions.is_some() {
+            if is_recognized_header && fields.header.entry_type().is_pax_local_extensions() {
+                if this.pax_extensions.is_some() {
                     return Poll::Ready(Some(Err(other(
                         "two pax extensions entries describing \
                          the same member",
                     ))));
                 }
-                let mut ef = EntryFields::from(entry);
-                let val = ready_err!(Pin::new(&mut ef).poll_read_all(cx));
-                self.pax_extensions = Some(val);
+                *this.pax_extensions = Some(ready_err!(Pin::new(fields).poll_read_all(cx)));
+                *this.fields = None;
                 continue;
             }
 
-            let mut fields = EntryFields::from(entry);
-            fields.long_pathname = self.gnu_longname.take();
-            fields.long_linkname = self.gnu_longlink.take();
-            fields.pax_extensions = self.pax_extensions.take();
+            fields.long_pathname = this.gnu_longname.take();
+            fields.long_linkname = this.gnu_longlink.take();
+            fields.pax_extensions = this.pax_extensions.take();
 
-            let archive = self.archive.clone();
-            let (next, _, current_pos, current_ext) = &mut self.current;
-
+            let (next, _, current_pos, current_ext) = &mut this.current;
             ready_err!(poll_parse_sparse_header(
-                archive,
+                this.archive,
                 next,
                 current_ext,
                 current_pos,
-                &mut fields,
+                fields,
                 cx
             ));
 
-            return Poll::Ready(Some(Ok(fields.into_entry())));
+            return Poll::Ready(Some(Ok(this.fields.take().unwrap().into_entry())));
         }
     }
 }
@@ -351,12 +385,12 @@ impl<R: Read + Unpin> Stream for RawEntries<R> {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let archive = self.archive.clone();
         let (next, current_header, current_header_pos) = &mut self.current;
-        poll_next_raw(archive, next, current_header, current_header_pos, cx)
+        poll_next_raw(&archive, next, current_header, current_header_pos, cx)
     }
 }
 
 fn poll_next_raw<R: Read + Unpin>(
-    mut archive: Archive<R>,
+    archive: &Archive<R>,
     next: &mut u64,
     current_header: &mut Option<Header>,
     current_header_pos: &mut usize,
@@ -365,24 +399,27 @@ fn poll_next_raw<R: Read + Unpin>(
     let mut header_pos = *next;
 
     loop {
+        let archive = archive.clone();
         // Seek to the start of the next header in the archive
         if current_header.is_none() {
-            let delta = *next - archive.inner.pos.load(Ordering::SeqCst);
-            match futures_core::ready!(poll_skip(&mut archive, cx, delta)) {
+            let delta = *next - archive.inner.lock().unwrap().pos;
+            match futures_core::ready!(poll_skip(archive.clone(), cx, delta)) {
                 Ok(_) => {}
                 Err(err) => return Poll::Ready(Some(Err(err))),
             }
+
             *current_header = Some(Header::new_old());
             *current_header_pos = 0;
         }
 
         let header = current_header.as_mut().unwrap();
+
         // EOF is an indicator that we are at the end of the archive.
         match futures_core::ready!(poll_try_read_all(
-            &mut archive,
+            archive.clone(),
             cx,
             header.as_mut_bytes(),
-            current_header_pos
+            current_header_pos,
         )) {
             Ok(true) => {}
             Ok(false) => return Poll::Ready(None),
@@ -397,7 +434,7 @@ fn poll_next_raw<R: Read + Unpin>(
             break;
         }
 
-        if !archive.inner.ignore_zeros {
+        if !archive.inner.lock().unwrap().ignore_zeros {
             return Poll::Ready(None);
         }
 
@@ -406,6 +443,7 @@ fn poll_next_raw<R: Read + Unpin>(
     }
 
     let header = current_header.as_mut().unwrap();
+
     // Make sure the checksum is ok
     let sum = header.as_bytes()[..148]
         .iter()
@@ -420,24 +458,29 @@ fn poll_next_raw<R: Read + Unpin>(
     let file_pos = *next;
     let size = header.entry_size()?;
 
-    let mut data = VecDeque::with_capacity(1);
-    data.push_back(EntryIo::Data(archive.clone().take(size)));
-    drop(header);
+    let data = EntryIo::Data(archive.clone().take(size));
 
     let header = current_header.take().unwrap();
+
+    let ArchiveInner {
+        unpack_xattrs,
+        preserve_mtime,
+        preserve_permissions,
+        ..
+    } = &*archive.inner.lock().unwrap();
 
     let ret = EntryFields {
         size,
         header_pos,
         file_pos,
-        data,
+        data: vec![data],
         header,
         long_pathname: None,
         long_linkname: None,
         pax_extensions: None,
-        unpack_xattrs: archive.inner.unpack_xattrs,
-        preserve_permissions: archive.inner.preserve_permissions,
-        preserve_mtime: archive.inner.preserve_mtime,
+        unpack_xattrs: *unpack_xattrs,
+        preserve_permissions: *preserve_permissions,
+        preserve_mtime: *preserve_mtime,
         read_state: None,
     };
 
@@ -450,7 +493,7 @@ fn poll_next_raw<R: Read + Unpin>(
 }
 
 fn poll_parse_sparse_header<R: Read + Unpin>(
-    mut archive: Archive<R>,
+    archive: &Archive<R>,
     next: &mut u64,
     current_ext: &mut Option<GnuExtSparseHeader>,
     current_ext_pos: &mut usize,
@@ -512,7 +555,7 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
                 ));
             } else if cur < off {
                 let block = io::repeat(0).take(off - cur);
-                data.push_back(EntryIo::Pad(block));
+                data.push(EntryIo::Pad(block));
             }
             cur = off
                 .checked_add(len)
@@ -523,10 +566,10 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
                      listed",
                 )
             })?;
-            data.push_back(EntryIo::Data(reader.clone().take(len)));
+            data.push(EntryIo::Data(reader.clone().take(len)));
             Ok(())
         };
-        for block in gnu.sparse.iter() {
+        for block in &gnu.sparse {
             add_block(block)?
         }
         if gnu.is_extended() {
@@ -541,10 +584,10 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
             let ext = current_ext.as_mut().unwrap();
             while ext.is_extended() {
                 match futures_core::ready!(poll_try_read_all(
-                    &mut archive,
+                    archive.clone(),
                     cx,
                     ext.as_mut_bytes(),
-                    current_ext_pos
+                    current_ext_pos,
                 )) {
                     Ok(true) => {}
                     Ok(false) => return Poll::Ready(Err(other("failed to read extension"))),
@@ -552,7 +595,7 @@ fn poll_parse_sparse_header<R: Read + Unpin>(
                 }
 
                 *next += 512;
-                for block in ext.sparse.iter() {
+                for block in &ext.sparse {
                     add_block(block)?;
                 }
             }
@@ -581,19 +624,16 @@ impl<R: Read + Unpin> Read for Archive<R> {
         cx: &mut Context<'_>,
         into: &mut io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let mut r = if let Ok(v) = self.inner.obj.try_lock() {
-            v
-        } else {
-            return Poll::Pending;
-        };
+        let mut lock = self.inner.lock().unwrap();
+        let mut inner = Pin::new(&mut *lock);
+        let r = Pin::new(&mut inner.obj);
 
-        let res = futures_core::ready!(Pin::new(&mut *r).poll_read(cx, into));
+        let start = into.filled().len();
+        let res = futures_core::ready!(r.poll_read(cx, into));
         match res {
-            Ok(()) => {
-                self.inner
-                    .pos
-                    .fetch_add(into.filled().len() as u64, Ordering::SeqCst);
-                Poll::Ready(Ok(()))
+            Ok(i) => {
+                inner.pos += (into.filled().len() - start) as u64;
+                Poll::Ready(Ok(i))
             }
             Err(err) => Poll::Ready(Err(err)),
         }
@@ -611,16 +651,16 @@ fn poll_try_read_all<R: Read + Unpin>(
     pos: &mut usize,
 ) -> Poll<io::Result<bool>> {
     while *pos < buf.len() {
-        let mut read_buf = io::ReadBuf::new(&mut buf[*pos..]);
-        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut read_buf)) {
-            Ok(()) if read_buf.filled().is_empty() => {
+        let mut buf = io::ReadBuf::new(&mut buf[*pos..]);
+        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut buf)) {
+            Ok(()) if buf.filled().is_empty() => {
                 if *pos == 0 {
                     return Poll::Ready(Ok(false));
                 }
 
                 return Poll::Ready(Err(other("failed to read entire block")));
             }
-            Ok(()) => *pos += read_buf.filled().len(),
+            Ok(()) => *pos += buf.filled().len(),
             Err(err) => return Poll::Ready(Err(err)),
         }
     }
@@ -637,18 +677,29 @@ fn poll_skip<R: Read + Unpin>(
 ) -> Poll<io::Result<()>> {
     let mut buf = [0u8; 4096 * 8];
     while amt > 0 {
-        let n = cmp::min(amt, buf.len() as u64);
-        let mut read_buf = io::ReadBuf::new(&mut buf[..n as usize]);
-        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut read_buf)) {
-            Ok(()) if read_buf.filled().is_empty() => {
+        let mut buf = io::ReadBuf::new(&mut buf);
+        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut buf.take(amt.try_into().unwrap()))) {
+            Ok(()) if buf.filled().is_empty() => {
                 return Poll::Ready(Err(other("unexpected EOF during skip")));
             }
             Ok(()) => {
-                amt -= read_buf.filled().len() as u64;
+                amt -= buf.filled().len() as u64;
             }
             Err(err) => return Poll::Ready(Err(err)),
         }
     }
 
     Poll::Ready(Ok(()))
+}
+
+#[cfg(test)]
+mod tests {
+    use static_assertions::assert_impl_all;
+
+    use super::*;
+
+    assert_impl_all!(tokio::fs::File: Send, Sync);
+    assert_impl_all!(Entries<tokio::fs::File>: Send, Sync);
+    assert_impl_all!(Archive<tokio::fs::File>: Send, Sync);
+    assert_impl_all!(Entry<Archive<tokio::fs::File>>: Send, Sync);
 }
