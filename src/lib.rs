@@ -17,12 +17,12 @@
 //     implementations are all found in this crate and the generic functions are
 //     all just super thin wrappers (e.g. easy to codegen).
 
-#![deny(missing_docs)]
+// #![deny(missing_docs)]
 
 use std::io::{Error, ErrorKind};
 
 pub use crate::{
-    archive::{Archive, ArchiveBuilder, Entries},
+    archive::{Archive, Entries},
     builder::Builder,
     entry::{Entry, Unpacked},
     entry_type::EntryType,

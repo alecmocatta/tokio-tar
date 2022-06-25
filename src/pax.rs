@@ -1,6 +1,4 @@
-use std::{slice, str};
-
-use tokio::io;
+use std::{io, slice, str};
 
 use crate::other;
 
@@ -12,16 +10,45 @@ pub struct PaxExtensions<'entry> {
     data: slice::Split<'entry, u8, fn(&u8) -> bool>,
 }
 
+impl<'entry> PaxExtensions<'entry> {
+    /// Create new pax extensions iterator from the given entry data.
+    pub fn new(a: &'entry [u8]) -> Self {
+        fn is_newline(a: &u8) -> bool {
+            *a == b'\n'
+        }
+        PaxExtensions {
+            data: a.split(is_newline),
+        }
+    }
+}
+
 /// A key/value pair corresponding to a pax extension.
 pub struct PaxExtension<'entry> {
     key: &'entry [u8],
     value: &'entry [u8],
 }
 
-pub fn pax_extensions(a: &[u8]) -> PaxExtensions {
-    PaxExtensions {
-        data: a.split(|a| *a == b'\n'),
+pub fn pax_extensions_size(a: &[u8]) -> Option<u64> {
+    for extension in PaxExtensions::new(a) {
+        let current_extension = match extension {
+            Ok(ext) => ext,
+            Err(_) => return None,
+        };
+        if current_extension.key() != Ok("size") {
+            continue;
+        }
+
+        let value = match current_extension.value() {
+            Ok(value) => value,
+            Err(_) => return None,
+        };
+        let size = match value.parse::<u64>() {
+            Ok(size) => size,
+            Err(_) => return None,
+        };
+        return Some(size);
     }
+    None
 }
 
 impl<'entry> Iterator for PaxExtensions<'entry> {

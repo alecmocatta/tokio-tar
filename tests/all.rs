@@ -9,9 +9,9 @@ use tokio::{
 };
 use tokio_stream::*;
 
-use tokio_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header};
 use filetime::FileTime;
 use tempfile::{Builder as TempBuilder, TempDir};
+use tokio_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header};
 
 macro_rules! t {
     ($e:expr) => {
@@ -487,7 +487,10 @@ async fn extracting_malicious_tarball() {
 
     {
         let mut a = Builder::new(&mut evil_tar);
-        async fn append<R: AsyncWrite + Unpin + Send + Sync>(a: &mut Builder<R>, path: &'static str) {
+        async fn append<R: AsyncWrite + Unpin + Send + Sync>(
+            a: &mut Builder<R>,
+            path: &'static str,
+        ) {
             let mut header = Header::new_gnu();
             assert!(header.set_path(path).is_err(), "was ok: {:?}", path);
             {

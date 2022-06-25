@@ -1,5 +1,5 @@
-use tokio_tar::Builder;
 use tokio::fs::File;
+use tokio_tar::Builder;
 
 fn main() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {
