@@ -63,7 +63,7 @@ pub struct EntryFields<'a> {
 #[pin_project(project = EntryIoProject)]
 pub enum EntryIo<'a> {
     Pad(#[pin] io::Take<io::Repeat>),
-    Data(#[pin] io::Take<&'a ArchiveInner<dyn Read + 'a>>),
+    Data(#[pin] io::Take<Pin<&'a ArchiveInner<dyn Read + 'a>>>),
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom

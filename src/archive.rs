@@ -20,7 +20,9 @@ use crate::{
 /// A top-level representation of an archive file.
 ///
 /// This archive can have an entry added to it and it can be iterated over.
+#[pin_project]
 pub struct Archive<R: ?Sized + Read> {
+    #[pin]
     inner: ArchiveInner<R>,
 }
 
@@ -47,7 +49,7 @@ trait SeekRead: Read + Seek {}
 impl<R: Read + Seek> SeekRead for R {}
 
 struct EntriesFields<'a> {
-    archive: &'a Archive<dyn Read + 'a>,
+    archive: Pin<&'a Archive<dyn Read + 'a>>,
     seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
     next: u64,
     done: bool,
@@ -196,7 +198,7 @@ impl Archive<dyn Read + '_> {
             ));
         }
         Ok(EntriesFields {
-            archive: self,
+            archive: unsafe { Pin::new_unchecked(self) },
             seekable_archive,
             done: false,
             next: 0,
@@ -273,7 +275,7 @@ impl<'a> EntriesFields<'a> {
             self.skip(delta).await?;
 
             // EOF is an indicator that we are at the end of the archive.
-            if !try_read_all(&mut &self.archive.inner, header.as_mut_bytes()).await? {
+            if !try_read_all(self.archive.project_ref().inner, header.as_mut_bytes()).await? {
                 return Ok(None);
             }
 
@@ -314,7 +316,7 @@ impl<'a> EntriesFields<'a> {
             size,
             header_pos,
             file_pos,
-            data: vec![EntryIo::Data((&self.archive.inner).take(size))],
+            data: vec![EntryIo::Data(self.archive.project_ref().inner.take(size))],
             header,
             long_pathname: None,
             long_linkname: None,
@@ -444,7 +446,7 @@ impl<'a> EntriesFields<'a> {
         let mut remaining = entry.size;
         {
             let data = &mut entry.data;
-            let reader = &self.archive.inner;
+            let reader = self.archive.project_ref().inner;
             let size = entry.size;
             let mut add_block = |block: &GnuSparseHeader| -> io::Result<_> {
                 if block.is_empty() {
@@ -485,7 +487,7 @@ impl<'a> EntriesFields<'a> {
                 let mut ext = GnuExtSparseHeader::new();
                 ext.isextended[0] = 1;
                 while ext.is_extended() {
-                    if !try_read_all(&mut &self.archive.inner, ext.as_mut_bytes()).await? {
+                    if !try_read_all(self.archive.project_ref().inner, ext.as_mut_bytes()).await? {
                         return Err(other("failed to read extension"));
                     }
 
@@ -522,7 +524,7 @@ impl<'a> EntriesFields<'a> {
         let mut buf = [0u8; 4096 * 8];
         while amt > 0 {
             let n = cmp::min(amt, buf.len() as u64);
-            let n = (&self.archive.inner).read(&mut buf[..n as usize]).await?;
+            let n = self.archive.project_ref().inner.read(&mut buf[..n as usize]).await?;
             if n == 0 {
                 return Err(other("unexpected EOF during skip"));
             }
@@ -553,16 +555,30 @@ impl<'a> EntriesFields<'a> {
     }
 }
 
-impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
+// impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
+//     fn poll_read(
+//         self: Pin<&mut Self>,
+//         cx: &mut Context<'_>,
+//         into: &mut ReadBuf<'_>,
+//     ) -> Poll<Result<(), io::Error>> {
+//         let a: Pin<&&ArchiveInner<R>> = self.as_ref();
+//         let a: Pin<&ArchiveInner<R>> = unsafe { a.map_unchecked(|x| *x) };
+//         let start = into.filled().len();
+//         let ret = PinMut::as_mut(&mut a.project_ref().obj.borrow_mut()).poll_read(cx, into);
+//         let i = into.filled().len() - start;
+//         self.pos.set(self.pos.get() + i as u64);
+//         ret
+//     }
+// }
+
+impl<'a, R: ?Sized + Read> Read for Pin<&'a ArchiveInner<R>> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         into: &mut ReadBuf<'_>,
     ) -> Poll<Result<(), io::Error>> {
-        let a: Pin<&&ArchiveInner<R>> = self.as_ref();
-        let a: Pin<&ArchiveInner<R>> = unsafe { a.map_unchecked(|x| *x) };
         let start = into.filled().len();
-        let ret = PinMut::as_mut(&mut a.project_ref().obj.borrow_mut()).poll_read(cx, into);
+        let ret = PinMut::as_mut(&mut self.project_ref().obj.borrow_mut()).poll_read(cx, into);
         let i = into.filled().len() - start;
         self.pos.set(self.pos.get() + i as u64);
         ret
@@ -585,7 +601,7 @@ impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
 ///
 /// If the reader reaches its end before filling the buffer at all, returns `false`.
 /// Otherwise returns `true`.
-async fn try_read_all<R: Read + Unpin>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+async fn try_read_all<R: Read + Unpin>(mut r: R, buf: &mut [u8]) -> io::Result<bool> {
     let mut read = 0;
     while read < buf.len() {
         match r.read(&mut buf[read..]).await? {
