@@ -1,10 +1,3 @@
-extern crate tokio_tar as async_tar;
-
-extern crate filetime;
-extern crate tempfile;
-#[cfg(all(unix, feature = "xattr"))]
-extern crate xattr;
-
 use std::{
     io::Cursor,
     iter::repeat,
@@ -16,7 +9,7 @@ use tokio::{
 };
 use tokio_stream::*;
 
-use async_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header};
+use tokio_tar::{Archive, ArchiveBuilder, Builder, EntryType, Header};
 use filetime::FileTime;
 use tempfile::{Builder as TempBuilder, TempDir};
 
@@ -45,15 +38,14 @@ async fn simple_concat() {
     let mut archive_bytes = Vec::new();
     archive_bytes.extend(bytes);
 
-    let original_names: Vec<String> =
-        decode_names(&mut Archive::new(Cursor::new(&archive_bytes))).await;
+    let original_names: Vec<String> = decode_names(Archive::new(Cursor::new(&archive_bytes))).await;
     let expected: Vec<&str> = original_names.iter().map(|n| n.as_str()).collect();
 
     // concat two archives (with null in-between);
     archive_bytes.extend(bytes);
 
     // test now that when we read the archive, it stops processing at the first zero header.
-    let actual = decode_names(&mut Archive::new(Cursor::new(&archive_bytes))).await;
+    let actual = decode_names(Archive::new(Cursor::new(&archive_bytes))).await;
     assert_eq!(expected, actual);
 
     // extend expected by itself.
@@ -65,14 +57,14 @@ async fn simple_concat() {
     };
 
     let builder = ArchiveBuilder::new(Cursor::new(&archive_bytes)).set_ignore_zeros(true);
-    let mut ar = builder.build();
+    let ar = builder.build();
 
-    let actual = decode_names(&mut ar).await;
+    let actual = decode_names(ar).await;
     assert_eq!(expected, actual);
 
-    async fn decode_names<R>(ar: &mut Archive<R>) -> Vec<String>
+    async fn decode_names<R>(ar: Archive<R>) -> Vec<String>
     where
-        R: AsyncRead + Unpin,
+        R: AsyncRead + Unpin + Sync + Send,
     {
         let mut names = Vec::new();
         let mut entries = t!(ar.entries());
@@ -88,7 +80,7 @@ async fn simple_concat() {
 
 #[tokio::test]
 async fn header_impls() {
-    let mut ar = Archive::new(Cursor::new(tar!("simple.tar")));
+    let ar = Archive::new(Cursor::new(tar!("simple.tar")));
     let hn = Header::new_old();
     let hnb = hn.as_bytes();
     let mut entries = t!(ar.entries());
@@ -104,7 +96,7 @@ async fn header_impls() {
 
 #[tokio::test]
 async fn header_impls_missing_last_header() {
-    let mut ar = Archive::new(Cursor::new(tar!("simple_missing_last_header.tar")));
+    let ar = Archive::new(Cursor::new(tar!("simple_missing_last_header.tar")));
     let hn = Header::new_old();
     let hnb = hn.as_bytes();
     let mut entries = t!(ar.entries());
@@ -122,7 +114,7 @@ async fn header_impls_missing_last_header() {
 #[tokio::test]
 async fn reading_files() {
     let rdr = Cursor::new(tar!("reading_files.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     let mut entries = t!(ar.entries());
 
     let mut a = t!(entries.next().await.unwrap());
@@ -153,7 +145,7 @@ async fn writing_files() {
         .await);
 
     let data = t!(ar.into_inner().await);
-    let mut ar = Archive::new(Cursor::new(data));
+    let ar = Archive::new(Cursor::new(data));
     let mut entries = t!(ar.entries());
     let mut f = t!(entries.next().await.unwrap());
 
@@ -174,20 +166,20 @@ async fn large_filename() {
     let path = td.path().join("test");
     t!(t!(File::create(&path).await).write_all(b"test").await);
 
-    let filename = repeat("abcd/").take(50).collect::<String>();
+    let filename = "abcd/".repeat(50);
     let mut header = Header::new_ustar();
     header.set_path(&filename).unwrap();
     header.set_metadata(&t!(fs::metadata(&path).await));
     header.set_cksum();
     t!(ar.append(&header, &b"test"[..]).await);
-    let too_long = repeat("abcd").take(200).collect::<String>();
+    let too_long = "abcd".repeat(200);
     t!(ar
         .append_file(&too_long, &mut t!(File::open(&path).await))
         .await);
     t!(ar.append_data(&mut header, &too_long, &b"test"[..]).await);
 
     let rd = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rd);
+    let ar = Archive::new(rd);
     let mut entries = t!(ar.entries());
 
     // The short entry added with `append`
@@ -221,7 +213,7 @@ async fn large_filename() {
 #[tokio::test]
 async fn reading_entries() {
     let rdr = Cursor::new(tar!("reading_files.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     let mut entries = t!(ar.entries());
     let mut a = t!(entries.next().await.unwrap());
     assert_eq!(&*a.header().path_bytes(), b"a");
@@ -262,7 +254,7 @@ async fn check_dirtree(td: &TempDir) {
 async fn extracting_directories() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     let rdr = Cursor::new(tar!("directory.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     t!(ar.unpack(td.path()).await);
     check_dirtree(&td).await;
 }
@@ -277,7 +269,7 @@ async fn xattrs() {
         .tempdir_in("/var/tmp"));
     let rdr = Cursor::new(tar!("xattrs.tar"));
     let builder = ArchiveBuilder::new(rdr).set_unpack_xattrs(true);
-    let mut ar = builder.build();
+    let ar = builder.build();
     t!(ar.unpack(td.path()).await);
 
     let val = xattr::get(td.path().join("a/b"), "user.pax.flags").unwrap();
@@ -294,7 +286,7 @@ async fn no_xattrs() {
         .tempdir_in("/var/tmp"));
     let rdr = Cursor::new(tar!("xattrs.tar"));
     let builder = ArchiveBuilder::new(rdr).set_unpack_xattrs(false);
-    let mut ar = builder.build();
+    let ar = builder.build();
     t!(ar.unpack(td.path()).await);
 
     assert_eq!(
@@ -318,7 +310,7 @@ async fn writing_and_extracting_directories() {
     t!(ar.finish().await);
 
     let rdr = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     t!(ar.unpack(td.path()).await);
     check_dirtree(&td).await;
 }
@@ -342,7 +334,7 @@ async fn writing_directories_recursively() {
     t!(ar.append_dir_all("foobar", base_dir).await);
     let data = t!(ar.into_inner().await);
 
-    let mut ar = Archive::new(Cursor::new(data));
+    let ar = Archive::new(Cursor::new(data));
     t!(ar.unpack(td.path()).await);
     let base_dir = td.path().join("foobar");
     assert!(fs::metadata(&base_dir)
@@ -385,7 +377,7 @@ async fn append_dir_all_blank_dest() {
     t!(ar.append_dir_all("", base_dir).await);
     let data = t!(ar.into_inner().await);
 
-    let mut ar = Archive::new(Cursor::new(data));
+    let ar = Archive::new(Cursor::new(data));
     t!(ar.unpack(td.path()).await);
     let base_dir = td.path();
     assert!(fs::metadata(&base_dir)
@@ -424,7 +416,7 @@ async fn append_dir_all_does_not_work_on_non_directory() {
 async fn extracting_duplicate_dirs() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     let rdr = Cursor::new(tar!("duplicate_dirs.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     t!(ar.unpack(td.path()).await);
 
     let some_dir = td.path().join("some_dir");
@@ -449,17 +441,13 @@ async fn unpack_old_style_bsd_dir() {
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rdr);
-    t!(ar.unpack(td.path()).await);
+    let ar = Archive::new(rdr);
+    t!(ar.clone().unpack(td.path()).await);
 
     // Iterating
     let rdr = Cursor::new(ar.into_inner().map_err(|_| ()).unwrap().into_inner());
-    let mut ar = Archive::new(rdr);
-    let mut entries = t!(ar.entries());
-
-    while let Some(e) = entries.next().await {
-        assert!(e.is_ok());
-    }
+    let ar = Archive::new(rdr);
+    assert!(t!(ar.entries()).all(|fr| fr.is_ok()).await);
 
     assert!(td.path().join("testdir").is_dir());
 }
@@ -482,19 +470,13 @@ async fn handling_incorrect_file_size() {
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rdr);
-    assert!(ar.unpack(td.path()).await.is_err());
+    let ar = Archive::new(rdr);
+    assert!(ar.clone().unpack(td.path()).await.is_err());
 
     // Iterating
     let rdr = Cursor::new(ar.into_inner().map_err(|_| ()).unwrap().into_inner());
-    let mut ar = Archive::new(rdr);
-    let mut entries = t!(ar.entries());
-    while let Some(fr) = entries.next().await {
-        if fr.is_err() {
-            return;
-        }
-    }
-    panic!("Should have errorred");
+    let ar = Archive::new(rdr);
+    assert!(t!(ar.entries()).any(|fr| fr.is_err()).await);
 }
 
 #[tokio::test]
@@ -503,9 +485,9 @@ async fn extracting_malicious_tarball() {
 
     let mut evil_tar = Vec::new();
 
-    evil_tar = {
-        let mut a = Builder::new(evil_tar);
-        async fn append<R: AsyncWrite + Send + Unpin>(a: &mut Builder<R>, path: &'static str) {
+    {
+        let mut a = Builder::new(&mut evil_tar);
+        async fn append<R: AsyncWrite + Unpin + Send + Sync>(a: &mut Builder<R>, path: &'static str) {
             let mut header = Header::new_gnu();
             assert!(header.set_path(path).is_err(), "was ok: {:?}", path);
             {
@@ -534,10 +516,9 @@ async fn extracting_malicious_tarball() {
         append(&mut a, "..").await;
         append(&mut a, "/////////..").await;
         append(&mut a, "/////////").await;
-        a.into_inner().await.unwrap()
-    };
+    }
 
-    let mut ar = Archive::new(&evil_tar[..]);
+    let ar = Archive::new(&evil_tar[..]);
     t!(ar.unpack(td.path()).await);
 
     assert!(fs::metadata("/tmp/abs_evil.txt").await.is_err());
@@ -601,7 +582,7 @@ async fn extracting_malicious_tarball() {
 #[tokio::test]
 async fn octal_spaces() {
     let rdr = Cursor::new(tar!("spaces.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
 
     let entry = ar.entries().unwrap().next().await.unwrap().unwrap();
     assert_eq!(entry.header().mode().unwrap() & 0o777, 0o777);
@@ -635,7 +616,7 @@ async fn extracting_malformed_tar_null_blocks() {
     t!(ar.finish().await);
 
     let data = t!(ar.into_inner().await);
-    let mut ar = Archive::new(&data[..]);
+    let ar = Archive::new(&data[..]);
     assert!(ar.unpack(td.path()).await.is_ok());
 }
 
@@ -643,7 +624,7 @@ async fn extracting_malformed_tar_null_blocks() {
 async fn empty_filename() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     let rdr = Cursor::new(tar!("empty_filename.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     assert!(ar.unpack(td.path()).await.is_ok());
 }
 
@@ -651,7 +632,7 @@ async fn empty_filename() {
 async fn file_times() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     let rdr = Cursor::new(tar!("file_times.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     t!(ar.unpack(td.path()).await);
 
     let meta = fs::metadata(td.path().join("a")).await.unwrap();
@@ -669,7 +650,7 @@ async fn backslash_treated_well() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     let mut ar = Builder::new(Vec::<u8>::new());
     t!(ar.append_dir("foo\\bar", td.path()).await);
-    let mut ar = Archive::new(Cursor::new(t!(ar.into_inner().await)));
+    let ar = Archive::new(Cursor::new(t!(ar.into_inner().await)));
     let f = t!(t!(ar.entries()).next().await.unwrap());
     if cfg!(unix) {
         assert_eq!(t!(f.header().path()).to_str(), Some("foo\\bar"));
@@ -688,11 +669,11 @@ async fn backslash_treated_well() {
     header.set_cksum();
     t!(ar.append(&header, &mut io::empty()).await);
     let data = t!(ar.into_inner().await);
-    let mut ar = Archive::new(&data[..]);
+    let ar = Archive::new(&data[..]);
     let f = t!(t!(ar.entries()).next().await.unwrap());
     assert_eq!(t!(f.header().path()).to_str(), Some("foo\\bar"));
 
-    let mut ar = Archive::new(&data[..]);
+    let ar = Archive::new(&data[..]);
     t!(ar.unpack(td.path()).await);
     assert!(fs::metadata(td.path().join("foo\\bar")).await.is_ok());
 }
@@ -711,7 +692,7 @@ async fn nul_bytes_in_path() {
 
 #[tokio::test]
 async fn links() {
-    let mut ar = Archive::new(Cursor::new(tar!("link.tar")));
+    let ar = Archive::new(Cursor::new(tar!("link.tar")));
     let mut entries = t!(ar.entries());
     let link = t!(entries.next().await.unwrap());
     assert_eq!(
@@ -726,7 +707,7 @@ async fn links() {
 #[cfg(unix)] // making symlinks on windows is hard
 async fn unpack_links() {
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
-    let mut ar = Archive::new(Cursor::new(tar!("link.tar")));
+    let ar = Archive::new(Cursor::new(tar!("link.tar")));
     t!(ar.unpack(td.path()).await);
 
     let md = t!(fs::symlink_metadata(td.path().join("lnk")).await);
@@ -740,7 +721,7 @@ async fn unpack_links() {
 
 #[tokio::test]
 async fn pax_simple() {
-    let mut ar = Archive::new(tar!("pax.tar"));
+    let ar = Archive::new(tar!("pax.tar"));
     let mut entries = t!(ar.entries());
 
     let mut first = t!(entries.next().await.unwrap());
@@ -760,7 +741,7 @@ async fn pax_simple() {
 
 #[tokio::test]
 async fn pax_path() {
-    let mut ar = Archive::new(tar!("pax2.tar"));
+    let ar = Archive::new(tar!("pax2.tar"));
     let mut entries = t!(ar.entries());
 
     let first = t!(entries.next().await.unwrap());
@@ -776,7 +757,7 @@ async fn long_name_trailing_nul() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'L'));
     h.set_cksum();
-    t!(b.append(&h, b"foo\0" as &[u8]).await);
+    t!(b.append(&h, "foo\0".as_bytes()).await);
     let mut h = Header::new_gnu();
 
     t!(h.set_path("bar"));
@@ -786,7 +767,7 @@ async fn long_name_trailing_nul() {
     t!(b.append(&h, b"foobar" as &[u8]).await);
 
     let contents = t!(b.into_inner().await);
-    let mut a = Archive::new(&contents[..]);
+    let a = Archive::new(&contents[..]);
 
     let e = t!(t!(a.entries()).next().await.unwrap());
     assert_eq!(&*e.path_bytes(), b"foo");
@@ -801,7 +782,7 @@ async fn long_linkname_trailing_nul() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'K'));
     h.set_cksum();
-    t!(b.append(&h, b"foo\0" as &[u8]).await);
+    t!(b.append(&h, "foo\0".as_bytes()).await);
     let mut h = Header::new_gnu();
 
     t!(h.set_path("bar"));
@@ -811,7 +792,7 @@ async fn long_linkname_trailing_nul() {
     t!(b.append(&h, b"foobar" as &[u8]).await);
 
     let contents = t!(b.into_inner().await);
-    let mut a = Archive::new(&contents[..]);
+    let a = Archive::new(&contents[..]);
 
     let e = t!(t!(a.entries()).next().await.unwrap());
     assert_eq!(&*e.link_name_bytes().unwrap(), b"foo");
@@ -824,12 +805,12 @@ async fn encoded_long_name_has_trailing_nul() {
     t!(t!(File::create(&path).await).write_all(b"test").await);
 
     let mut b = Builder::new(Vec::<u8>::new());
-    let long = repeat("abcd").take(200).collect::<String>();
+    let long = "abcd".repeat(200);
 
     t!(b.append_file(&long, &mut t!(File::open(&path).await)).await);
 
     let contents = t!(b.into_inner().await);
-    let mut a = Archive::new(&contents[..]);
+    let a = Archive::new(&contents[..]);
 
     let mut e = t!(t!(a.entries_raw()).next().await.unwrap());
     let mut name = Vec::new();
@@ -843,7 +824,7 @@ async fn encoded_long_name_has_trailing_nul() {
 #[tokio::test]
 async fn reading_sparse() {
     let rdr = Cursor::new(tar!("sparse.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     let mut entries = t!(ar.entries());
 
     let mut a = t!(entries.next().await.unwrap());
@@ -893,7 +874,7 @@ async fn reading_sparse() {
 #[tokio::test]
 async fn extract_sparse() {
     let rdr = Cursor::new(tar!("sparse.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
     t!(ar.unpack(td.path()).await);
 
@@ -971,7 +952,7 @@ async fn path_separators() {
         .await);
 
     let rd = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rd);
+    let ar = Archive::new(rd);
     let mut entries = t!(ar.entries());
 
     let entry = t!(entries.next().await.unwrap());
@@ -994,8 +975,8 @@ async fn append_path_symlink() {
     ar.follow_symlinks(false);
     let td = t!(TempBuilder::new().prefix("async-tar").tempdir());
 
-    let long_linkname = repeat("abcd").take(30).collect::<String>();
-    let long_pathname = repeat("dcba").take(30).collect::<String>();
+    let long_linkname = "abcd".repeat(30);
+    let long_pathname = "dcba".repeat(30);
     t!(env::set_current_dir(td.path()));
     // "short" path name / short link name
     t!(symlink("testdest", "test"));
@@ -1008,7 +989,7 @@ async fn append_path_symlink() {
     t!(ar.append_path(&long_pathname).await);
 
     let rd = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rd);
+    let ar = Archive::new(rd);
     let mut entries = t!(ar.entries());
 
     let entry = t!(entries.next().await.unwrap());
@@ -1049,7 +1030,7 @@ async fn name_with_slash_doesnt_fool_long_link_and_bsd_compat() {
     h.set_size(4);
     h.set_entry_type(EntryType::new(b'L'));
     h.set_cksum();
-    t!(ar.append(&h, b"foo\0" as &[u8]).await);
+    t!(ar.append(&h, "foo\0".as_bytes()).await);
 
     let mut header = Header::new_gnu();
     header.set_entry_type(EntryType::Regular);
@@ -1060,16 +1041,13 @@ async fn name_with_slash_doesnt_fool_long_link_and_bsd_compat() {
 
     // Extracting
     let rdr = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rdr);
-    t!(ar.unpack(td.path()).await);
+    let ar = Archive::new(rdr);
+    t!(ar.clone().unpack(td.path()).await);
 
     // Iterating
     let rdr = Cursor::new(ar.into_inner().map_err(|_| ()).unwrap().into_inner());
-    let mut ar = Archive::new(rdr);
-    let mut entries = t!(ar.entries());
-    while let Some(entry) = entries.next().await {
-        assert!(entry.is_ok());
-    }
+    let ar = Archive::new(rdr);
+    assert!(t!(ar.entries()).all(|fr| fr.is_ok()).await);
 
     assert!(td.path().join("foo").is_file());
 }
@@ -1090,13 +1068,14 @@ async fn insert_local_file_different_name() {
         .unwrap();
 
     let rd = Cursor::new(t!(ar.into_inner().await));
-    let mut ar = Archive::new(rd);
+    let ar = Archive::new(rd);
     let mut entries = t!(ar.entries());
     let entry = t!(entries.next().await.unwrap());
     assert_eq!(t!(entry.path()), Path::new("archive/dir"));
     let entry = t!(entries.next().await.unwrap());
     assert_eq!(t!(entry.path()), Path::new("archive/dir/f"));
-    assert!(entries.next().await.is_none());
+    let x = entries.next().await;
+    assert!(x.is_none(), "{:?}", x);
 }
 
 #[tokio::test]
@@ -1120,6 +1099,6 @@ async fn tar_directory_containing_symlink_to_directory() {
 async fn long_path() {
     let td = t!(TempBuilder::new().prefix("tar-rs").tempdir());
     let rdr = Cursor::new(tar!("7z_long_path.tar"));
-    let mut ar = Archive::new(rdr);
+    let ar = Archive::new(rdr);
     ar.unpack(td.path()).await.unwrap();
 }

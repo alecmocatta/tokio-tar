@@ -2,15 +2,15 @@
 
 use std::{
     fs::{self, File},
-    io::Write,
-    iter, mem,
+    io::{self, Write},
+    mem,
     path::Path,
     thread, time,
 };
 
 use tempfile::Builder;
 
-use async_tar::{GnuHeader, Header, HeaderMode};
+use tokio_tar::{GnuHeader, Header, HeaderMode};
 
 #[test]
 fn default_gnu() {
@@ -144,14 +144,18 @@ fn set_path() {
         assert_eq!(t!(h.path()).to_str(), Some("foo\\bar"));
     }
 
-    let long_name = iter::repeat("foo").take(100).collect::<String>();
-    let medium1 = iter::repeat("foo").take(52).collect::<String>();
-    let medium2 = iter::repeat("fo/").take(52).collect::<String>();
+    let long_name = "foo".repeat(100);
+    let medium1 = "foo".repeat(52);
+    let medium2 = "fo/".repeat(52);
 
     assert!(h.set_path(&long_name).is_err());
     assert!(h.set_path(&medium1).is_err());
     assert!(h.set_path(&medium2).is_err());
     assert!(h.set_path("\0").is_err());
+
+    assert!(h.set_path("..").is_err());
+    assert!(h.set_path("foo/..").is_err());
+    assert!(h.set_path("foo/../bar").is_err());
 
     h = Header::new_ustar();
     t!(h.set_path("foo"));
@@ -169,7 +173,7 @@ fn set_ustar_path_hard() {
     let p = Path::new("a").join(&vec!["a"; 100].join(""));
     t!(h.set_path(&p));
     let path = t!(h.path());
-    let actual: &Path = path.as_ref();
+    let actual: &Path = path.as_ref().into();
     assert_eq!(actual, p);
 }
 
@@ -178,7 +182,7 @@ fn set_metadata_deterministic() {
     let td = t!(Builder::new().prefix("async-tar").tempdir());
     let tmppath = td.path().join("tmpfile");
 
-    fn mk_header(path: &Path, readonly: bool) -> Header {
+    fn mk_header(path: &Path, readonly: bool) -> Result<Header, io::Error> {
         let mut file = t!(File::create(path));
         t!(file.write_all(b"c"));
         let mut perms = t!(file.metadata()).permissions();
@@ -186,13 +190,13 @@ fn set_metadata_deterministic() {
         t!(fs::set_permissions(path, perms));
         let mut h = Header::new_ustar();
         h.set_metadata_in_mode(&t!(path.metadata()), HeaderMode::Deterministic);
-        h
+        Ok(h)
     }
 
     // Create "the same" File twice in a row, one second apart, with differing readonly values.
-    let one = mk_header(tmppath.as_path(), false);
+    let one = t!(mk_header(tmppath.as_path(), false));
     thread::sleep(time::Duration::from_millis(1050));
-    let two = mk_header(tmppath.as_path(), true);
+    let two = t!(mk_header(tmppath.as_path(), true));
 
     // Always expected to match.
     assert_eq!(t!(one.size()), t!(two.size()));

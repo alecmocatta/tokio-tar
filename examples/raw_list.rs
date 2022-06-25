@@ -2,12 +2,10 @@
 //!
 //! Takes a tarball on stdin and prints out all of the entries inside.
 
-extern crate tokio_tar as async_tar;
-
 use tokio::io::stdin;
 use tokio_stream::*;
 
-use async_tar::Archive;
+use tokio_tar::Archive;
 
 fn main() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {

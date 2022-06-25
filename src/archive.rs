@@ -213,10 +213,10 @@ impl<R: Read + Unpin> Archive<R> {
     /// # Examples
     ///
     /// ```no_run
-    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { tokio::task::block_on(async {
+    /// # fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> { tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// #
     /// use tokio::fs::File;
-    /// use async_tar::Archive;
+    /// use tokio_tar::Archive;
     ///
     /// let mut ar = Archive::new(File::open("foo.tar").await?);
     /// ar.unpack("foo").await?;
@@ -631,9 +631,9 @@ impl<R: Read + Unpin> Read for Archive<R> {
         let start = into.filled().len();
         let res = futures_core::ready!(r.poll_read(cx, into));
         match res {
-            Ok(i) => {
+            Ok(()) => {
                 inner.pos += (into.filled().len() - start) as u64;
-                Poll::Ready(Ok(i))
+                Poll::Ready(Ok(()))
             }
             Err(err) => Poll::Ready(Err(err)),
         }
@@ -678,7 +678,8 @@ fn poll_skip<R: Read + Unpin>(
     let mut buf = [0u8; 4096 * 8];
     while amt > 0 {
         let mut buf = io::ReadBuf::new(&mut buf);
-        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut buf.take(amt.try_into().unwrap()))) {
+        let mut buf = buf.take(amt.try_into().unwrap());
+        match futures_core::ready!(Pin::new(&mut source).poll_read(cx, &mut buf)) {
             Ok(()) if buf.filled().is_empty() => {
                 return Poll::Ready(Err(other("unexpected EOF during skip")));
             }

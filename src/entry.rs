@@ -1,6 +1,3 @@
-use crate::{
-    error::TarError, header::bytes2path, other, pax::pax_extensions, Archive, Header, PaxExtensions,
-};
 use filetime::{self, FileTime};
 use std::{
     borrow::Cow,
@@ -19,12 +16,18 @@ use tokio::{
 };
 use pin_project::pin_project;
 
+use crate::{
+    error::TarError, header::bytes2path, other, pax::pax_extensions, Archive, Header, PaxExtensions,
+};
+
 /// A read-only view into an entry of an archive.
 ///
 /// This structure is a window into a portion of a borrowed archive which can
 /// be inspected. It acts as a file handle by implementing the Reader trait. An
 /// entry cannot be rewritten once inserted into an archive.
+#[pin_project]
 pub struct Entry<R: Read + Unpin> {
+    #[pin]
     fields: EntryFields<R>,
     _ignored: marker::PhantomData<Archive<R>>,
 }
@@ -48,10 +51,12 @@ pub struct EntryFields<R: Read + Unpin> {
     pub size: u64,
     pub header_pos: u64,
     pub file_pos: u64,
+    #[pin]
     pub data: Vec<EntryIo<R>>,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_mtime: bool,
+    #[pin]
     pub(crate) read_state: Option<EntryIo<R>>,
 }
 
@@ -74,16 +79,17 @@ impl<R: Read + Unpin> fmt::Debug for EntryFields<R> {
     }
 }
 
+#[pin_project(project = EntryIoProject)]
 pub enum EntryIo<R: Read + Unpin> {
-    Pad(io::Take<io::Repeat>),
-    Data(io::Take<R>),
+    Pad(#[pin] io::Take<io::Repeat>),
+    Data(#[pin] io::Take<R>),
 }
 
 impl<R: Read + Unpin> fmt::Debug for EntryIo<R> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            EntryIo::Pad(t) => write!(f, "EntryIo::Pad({})", t.limit()),
-            EntryIo::Data(t) => write!(f, "EntryIo::Data({})", t.limit()),
+            EntryIo::Pad(_) => write!(f, "EntryIo::Pad"),
+            EntryIo::Data(_) => write!(f, "EntryIo::Data"),
         }
     }
 }
@@ -308,11 +314,12 @@ impl<R: Read + Unpin> Entry<R> {
 
 impl<R: Read + Unpin> Read for Entry<R> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         into: &mut io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.as_mut().fields).poll_read(cx, into)
+        let mut this = self.project();
+        Pin::new(&mut *this.fields).poll_read(cx, into)
     }
 }
 
@@ -355,26 +362,23 @@ impl<R: Read + Unpin> EntryFields<R> {
     }
 
     fn path_bytes(&self) -> Cow<[u8]> {
-        match self.long_pathname {
-            Some(ref bytes) => {
-                if let Some(&0) = bytes.last() {
-                    Cow::Borrowed(&bytes[..bytes.len() - 1])
-                } else {
-                    Cow::Borrowed(bytes)
+        if let Some(ref bytes) = self.long_pathname {
+            if let Some(&0) = bytes.last() {
+                Cow::Borrowed(&bytes[..bytes.len() - 1])
+            } else {
+                Cow::Borrowed(bytes)
+            }
+        } else {
+            if let Some(ref pax) = self.pax_extensions {
+                let pax = pax_extensions(pax)
+                    .filter_map(Result::ok)
+                    .find(|f| f.key_bytes() == b"path")
+                    .map(|f| f.value_bytes());
+                if let Some(field) = pax {
+                    return Cow::Borrowed(field);
                 }
             }
-            None => {
-                if let Some(ref pax) = self.pax_extensions {
-                    let pax = pax_extensions(pax)
-                        .filter_map(|f| f.ok())
-                        .find(|f| f.key_bytes() == b"path")
-                        .map(|f| f.value_bytes());
-                    if let Some(field) = pax {
-                        return Cow::Borrowed(field);
-                    }
-                }
-                self.header.path_bytes()
-            }
+            self.header.path_bytes()
         }
     }
 
@@ -467,13 +471,11 @@ impl<R: Read + Unpin> EntryFields<R> {
             None => return Ok(false),
         };
 
-        if parent.symlink_metadata().is_err() {
-            fs::create_dir_all(&parent).await.map_err(|e| {
-                TarError::new(&format!("failed to create `{}`", parent.display()), e)
-            })?;
-        }
+        self.ensure_dir_created(dst, parent)
+            .await
+            .map_err(|e| TarError::new(&format!("failed to create `{}`", parent.display()), e))?;
 
-        let canon_target = self.validate_inside_dst(&dst, parent).await?;
+        let canon_target = self.validate_inside_dst(dst, parent).await?;
 
         self.unpack(Some(&canon_target), &file_dst)
             .await
@@ -543,7 +545,7 @@ impl<R: Read + Unpin> EntryFields<R> {
                     // use canonicalization to ensure this guarantee. For hard
                     // links though they're canonicalized to their existing path
                     // so we need to validate at this time.
-                    Some(ref p) => {
+                    Some(p) => {
                         let link_src = p.join(src);
                         self.validate_inside_dst(p, &link_src).await?;
                         link_src
@@ -584,10 +586,7 @@ impl<R: Read + Unpin> EntryFields<R> {
 
             #[cfg(windows)]
             async fn symlink(src: &Path, dst: &Path) -> io::Result<()> {
-                let (src, dst) = (src.to_owned(), dst.to_owned());
-                tokio::task::spawn_blocking(|| std::os::windows::fs::symlink_file(src, dst))
-                    .await
-                    .unwrap()
+                tokio::os::windows::fs::symlink_file(src, dst).await
             }
 
             #[cfg(any(unix, target_os = "redox"))]
@@ -631,19 +630,18 @@ impl<R: Read + Unpin> EntryFields<R> {
                 .open(dst)
                 .await
         }
-
         let mut f = async {
             let mut f = match open(dst).await {
                 Ok(f) => Ok(f),
                 Err(err) => {
-                    if err.kind() != ErrorKind::AlreadyExists {
-                        Err(err)
-                    } else {
+                    if err.kind() == ErrorKind::AlreadyExists {
                         match fs::remove_file(dst).await {
                             Ok(()) => open(dst).await,
                             Err(ref e) if e.kind() == io::ErrorKind::NotFound => open(dst).await,
                             Err(e) => Err(e),
                         }
+                    } else {
+                        Err(err)
                     }
                 }
             }?;
@@ -777,7 +775,7 @@ impl<R: Read + Unpin> EntryFields<R> {
                 _ => return Ok(()),
             };
             let exts = exts
-                .filter_map(|e| e.ok())
+                .filter_map(Result::ok)
                 .filter_map(|e| {
                     let key = e.key_bytes();
                     let prefix = b"SCHILY.xattr.";
@@ -820,15 +818,35 @@ impl<R: Read + Unpin> EntryFields<R> {
         }
     }
 
+    async fn ensure_dir_created(&self, dst: &Path, dir: &Path) -> io::Result<()> {
+        let mut ancestor = dir;
+        let mut dirs_to_create = Vec::new();
+        while tokio::fs::symlink_metadata(&ancestor).await.is_err() {
+            dirs_to_create.push(ancestor);
+            if let Some(parent) = ancestor.parent() {
+                ancestor = parent;
+            } else {
+                break;
+            }
+        }
+        for ancestor in dirs_to_create.into_iter().rev() {
+            if let Some(parent) = ancestor.parent() {
+                self.validate_inside_dst(dst, parent).await?;
+            }
+            fs::create_dir(ancestor).await?;
+        }
+        Ok(())
+    }
+
     async fn validate_inside_dst(&self, dst: &Path, file_dst: &Path) -> io::Result<PathBuf> {
         // Abort if target (canonical) parent is outside of `dst`
-        let canon_parent = file_dst.canonicalize().map_err(|err| {
+        let canon_parent = tokio::fs::canonicalize(&file_dst).await.map_err(|err| {
             Error::new(
                 err.kind(),
                 format!("{} while canonicalizing {}", err, file_dst.display()),
             )
         })?;
-        let canon_target = dst.canonicalize().map_err(|err| {
+        let canon_target = tokio::fs::canonicalize(&dst).await.map_err(|err| {
             Error::new(
                 err.kind(),
                 format!("{} while canonicalizing {}", err, dst.display()),
@@ -858,7 +876,7 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
         let mut this = self.project();
         loop {
             if this.read_state.is_none() {
-                if this.data.is_empty() {
+                if this.data.as_ref().is_empty() {
                     *this.read_state = None;
                 } else {
                     let data = &mut *this.data;
@@ -866,31 +884,26 @@ impl<R: Read + Unpin> Read for EntryFields<R> {
                 }
             }
 
-            if let Some(ref mut io) = &mut this.read_state {
+            if let Some(ref mut io) = &mut *this.read_state {
                 let start = into.filled().len();
-                let ret = Pin::new(io).poll_read(cx, into);
-                match ret {
-                    Poll::Ready(Ok(())) if into.filled().len() == start => {
+                match futures_core::ready!(Pin::new(io).poll_read(cx, into)) {
+                    Ok(()) if into.filled().len() == start => {
                         *this.read_state = None;
-                        if this.data.is_empty() {
+                        if this.data.as_ref().is_empty() {
                             return Poll::Ready(Ok(()));
                         }
                         continue;
                     }
-                    Poll::Ready(Ok(())) => {
+                    Ok(()) => {
                         return Poll::Ready(Ok(()));
                     }
-                    Poll::Ready(Err(err)) => {
+                    Err(err) => {
                         return Poll::Ready(Err(err));
                     }
-                    Poll::Pending => {
-                        return Poll::Pending;
-                    }
                 }
-            } else {
-                // Unable to pull another value from `data`, so we are done.
-                return Poll::Ready(Ok(()));
             }
+            // Unable to pull another value from `data`, so we are done.
+            return Poll::Ready(Ok(()));
         }
     }
 }
@@ -901,9 +914,9 @@ impl<R: Read + Unpin> Read for EntryIo<R> {
         cx: &mut Context<'_>,
         into: &mut io::ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        match self.get_mut() {
-            EntryIo::Pad(ref mut io) => Pin::new(io).poll_read(cx, into),
-            EntryIo::Data(ref mut io) => Pin::new(io).poll_read(cx, into),
+        match self.project() {
+            EntryIoProject::Pad(io) => io.poll_read(cx, into),
+            EntryIoProject::Data(io) => io.poll_read(cx, into),
         }
     }
 }

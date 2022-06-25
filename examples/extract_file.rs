@@ -4,13 +4,11 @@
 //! name as the first argument provided, and then prints the contents of that
 //! file to stdout.
 
-extern crate tokio_tar as async_tar;
-
 use std::{env::args_os, path::Path};
 use tokio::io::{copy, stdin, stdout};
 use tokio_stream::*;
 
-use async_tar::Archive;
+use tokio_tar::Archive;
 
 fn main() {
     tokio::runtime::Runtime::new().unwrap().block_on(async {

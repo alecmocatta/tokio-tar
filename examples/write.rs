@@ -1,6 +1,4 @@
-extern crate tokio_tar as async_tar;
-
-use async_tar::Builder;
+use tokio_tar::Builder;
 use tokio::fs::File;
 
 fn main() {

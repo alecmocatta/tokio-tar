@@ -1,42 +1,35 @@
-use crate::{
-    header::{bytes2path, path2bytes, HeaderMode},
-    other, EntryType, Header,
-};
 use std::{borrow::Cow, fs::Metadata, path::Path};
 use tokio::{
     fs,
     io::{self, AsyncRead as Read, AsyncReadExt, AsyncWrite as Write, AsyncWriteExt},
 };
 
+use crate::{
+    header::{bytes2path, path2bytes, HeaderMode},
+    other, EntryType, Header,
+};
+
 /// A structure for building archives
 ///
 /// This structure has methods for building up an archive from scratch into any
 /// arbitrary writer.
-pub struct Builder<W: Write + Unpin + Send + 'static> {
+pub struct Builder<W: Write + Unpin + Send + Sync> {
     mode: HeaderMode,
     follow: bool,
     finished: bool,
     obj: Option<W>,
-    cancellation: Option<tokio::sync::oneshot::Sender<W>>,
 }
 
-impl<W: Write + Unpin + Send + 'static> Builder<W> {
+impl<W: Write + Unpin + Send + Sync> Builder<W> {
     /// Create a new archive builder with the underlying object as the
     /// destination of all data written. The builder will use
     /// `HeaderMode::Complete` by default.
     pub fn new(obj: W) -> Builder<W> {
-        let (tx, rx) = tokio::sync::oneshot::channel::<W>();
-        tokio::spawn(async move {
-            if let Ok(mut w) = rx.await {
-                let _ = w.write_all(&[0; 1024]).await;
-            }
-        });
         Builder {
             mode: HeaderMode::Complete,
             follow: true,
             finished: false,
             obj: Some(obj),
-            cancellation: Some(tx),
         }
     }
 
@@ -120,7 +113,7 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     /// #
     /// # Ok(()) }) }
     /// ```
-    pub async fn append<R: Read + Unpin>(
+    pub async fn append<R: Read + Unpin + Send>(
         &mut self,
         header: &Header,
         mut data: R,
@@ -174,7 +167,7 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     /// #
     /// # Ok(()) }) }
     /// ```
-    pub async fn append_data<P: AsRef<Path>, R: Read + Unpin>(
+    pub async fn append_data<P: AsRef<Path>, R: Read + Unpin + Send>(
         &mut self,
         header: &mut Header,
         path: P,
@@ -182,7 +175,7 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     ) -> io::Result<()> {
         prepare_header_path(self.get_mut(), header, path.as_ref()).await?;
         header.set_cksum();
-        self.append(&header, data).await?;
+        self.append(header, data).await?;
 
         Ok(())
     }
@@ -409,10 +402,10 @@ impl<W: Write + Unpin + Send + 'static> Builder<W> {
     }
 }
 
-async fn append<Dst: Write + Unpin + ?Sized, Data: Read + Unpin + ?Sized>(
-    mut dst: &mut Dst,
+async fn append(
+    mut dst: &mut (dyn Write + Unpin + Send),
     header: &Header,
-    mut data: &mut Data,
+    mut data: &mut (dyn Read + Unpin + Send),
 ) -> io::Result<()> {
     dst.write_all(header.as_bytes()).await?;
     let len = io::copy(&mut data, &mut dst).await?;
@@ -427,8 +420,8 @@ async fn append<Dst: Write + Unpin + ?Sized, Data: Read + Unpin + ?Sized>(
     Ok(())
 }
 
-async fn append_path_with_name<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn append_path_with_name(
+    dst: &mut (dyn Write + Unpin + Sync + Send),
     path: &Path,
     name: Option<&Path>,
     mode: HeaderMode,
@@ -481,8 +474,8 @@ async fn append_path_with_name<Dst: Write + Unpin + ?Sized>(
     }
 }
 
-async fn append_file<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn append_file(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     path: &Path,
     file: &mut fs::File,
     mode: HeaderMode,
@@ -492,8 +485,8 @@ async fn append_file<Dst: Write + Unpin + ?Sized>(
     Ok(())
 }
 
-async fn append_dir<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn append_dir(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -518,8 +511,8 @@ fn prepare_header(size: u64, entry_type: EntryType) -> Header {
     header
 }
 
-async fn prepare_header_path<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn prepare_header_path(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     header: &mut Header,
     path: &Path,
 ) -> io::Result<()> {
@@ -528,7 +521,7 @@ async fn prepare_header_path<Dst: Write + Unpin + ?Sized>(
     // long name extension by emitting an entry which indicates that it's the
     // filename.
     if let Err(e) = header.set_path(path) {
-        let data = path2bytes(&path)?;
+        let data = path2bytes(path)?;
         let max = header.as_old().name.len();
         //  Since e isn't specific enough to let us know the path is indeed too
         //  long, verify it first before using the extension.
@@ -547,14 +540,14 @@ async fn prepare_header_path<Dst: Write + Unpin + ?Sized>(
     Ok(())
 }
 
-async fn prepare_header_link<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn prepare_header_link(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     header: &mut Header,
     link_name: &Path,
 ) -> io::Result<()> {
     // Same as previous function but for linkname
     if let Err(e) = header.set_link_name(&link_name) {
-        let data = path2bytes(&link_name)?;
+        let data = path2bytes(link_name)?;
         if data.len() < header.as_old().linkname.len() {
             return Err(e);
         }
@@ -565,11 +558,11 @@ async fn prepare_header_link<Dst: Write + Unpin + ?Sized>(
     Ok(())
 }
 
-async fn append_fs<Dst: Write + Unpin + ?Sized, R: Read + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn append_fs(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     path: &Path,
     meta: &Metadata,
-    read: &mut R,
+    read: &mut (dyn Read + Unpin + Sync + Send),
     mode: HeaderMode,
     link_name: Option<&Path>,
 ) -> io::Result<()> {
@@ -586,8 +579,8 @@ async fn append_fs<Dst: Write + Unpin + ?Sized, R: Read + Unpin + ?Sized>(
     Ok(())
 }
 
-async fn append_dir_all<Dst: Write + Unpin + ?Sized>(
-    dst: &mut Dst,
+async fn append_dir_all(
+    dst: &mut (dyn Write + Unpin + Send + Sync),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -619,15 +612,21 @@ async fn append_dir_all<Dst: Write + Unpin + ?Sized>(
     Ok(())
 }
 
-impl<W: Write + Unpin + Send + 'static> Drop for Builder<W> {
+impl<W: Write + Unpin + Send + Sync> Drop for Builder<W> {
     fn drop(&mut self) {
-        // TODO: proper async cancellation
-        if !self.finished {
-            let _ = self
-                .cancellation
-                .take()
-                .unwrap()
-                .send(self.obj.take().unwrap());
-        }
+        // assert!(self.finished, "call fn finish() or fn into_inner() before dropping");
+        // tokio::runtime::Runtime::new().unwrap().block_on(async move {
+        //     let _ = self.finish().await;
+        // });
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use static_assertions::assert_impl_all;
+
+    use super::*;
+
+    assert_impl_all!(tokio::fs::File: Send, Sync);
+    assert_impl_all!(Builder<tokio::fs::File>: Send, Sync);
 }
