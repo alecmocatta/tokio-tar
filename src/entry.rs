@@ -4,7 +4,6 @@ use std::{
     borrow::Cow,
     cmp,
     io::{Error, ErrorKind, SeekFrom},
-    marker,
     path::{Component, Path, PathBuf},
     pin::Pin,
     task::{Context, Poll},
@@ -15,19 +14,8 @@ use tokio::{
     io::{self, AsyncRead as Read, AsyncReadExt, AsyncSeekExt, ReadBuf},
 };
 
-// use std::borrow::Cow;
-// use std::cmp;
-// use std::fs;
-// use std::fs::OpenOptions;
-// use std::io::prelude::*;
-// use std::io::{self, Error, ErrorKind, SeekFrom};
-// use std::marker;
-// use std::path::{Component, Path, PathBuf};
-// use filetime::{self, FileTime};
-
 use crate::{
-    archive::ArchiveInner, error::TarError, header::bytes2path, other, Archive, Header,
-    PaxExtensions,
+    archive::ArchiveInner, error::TarError, header::bytes2path, other, Header, PaxExtensions,
 };
 
 /// A read-only view into an entry of an archive.
@@ -38,13 +26,12 @@ use crate::{
 #[pin_project]
 pub struct Entry<'a, R: 'a + Read> {
     #[pin]
-    fields: EntryFields<'a>,
-    _ignored: marker::PhantomData<&'a Archive<R>>,
+    fields: EntryFields<'a, R>,
 }
 
 // private implementation detail of `Entry`, but concrete (no type parameters)
 // and also all-public to be constructed from other modules.
-pub struct EntryFields<'a> {
+pub struct EntryFields<'a, R: Read> {
     pub long_pathname: Option<Vec<u8>>,
     pub long_linkname: Option<Vec<u8>>,
     pub pax_extensions: Option<Vec<u8>>,
@@ -52,7 +39,7 @@ pub struct EntryFields<'a> {
     pub size: u64,
     pub header_pos: u64,
     pub file_pos: u64,
-    pub data: Vec<EntryIo<'a>>,
+    pub data: Vec<EntryIo<'a, R>>,
     pub unpack_xattrs: bool,
     pub preserve_permissions: bool,
     pub preserve_ownerships: bool,
@@ -61,9 +48,9 @@ pub struct EntryFields<'a> {
 }
 
 #[pin_project(project = EntryIoProject)]
-pub enum EntryIo<'a> {
+pub enum EntryIo<'a, R: Read> {
     Pad(#[pin] io::Take<io::Repeat>),
-    Data(#[pin] io::Take<Pin<&'a ArchiveInner<dyn Read + 'a>>>),
+    Data(#[pin] io::Take<Pin<&'a ArchiveInner<R>>>),
 }
 
 /// When unpacking items the unpacked thing is returned to allow custom
@@ -288,16 +275,13 @@ impl<'a, R: Read> Read for Entry<'a, R> {
     }
 }
 
-impl<'a> EntryFields<'a> {
-    pub fn from<R: Read>(entry: Entry<R>) -> EntryFields {
+impl<'a, R: Read> EntryFields<'a, R> {
+    pub fn from(entry: Entry<'a, R>) -> Self {
         entry.fields
     }
 
-    pub fn into_entry<R: Read>(self) -> Entry<'a, R> {
-        Entry {
-            fields: self,
-            _ignored: marker::PhantomData,
-        }
+    pub fn into_entry(self) -> Entry<'a, R> {
+        Entry { fields: self }
     }
 
     pub async fn read_all(&mut self) -> io::Result<Vec<u8>> {
@@ -860,7 +844,7 @@ impl<'a> EntryFields<'a> {
         }
 
         #[cfg(all(unix, feature = "xattr"))]
-        async fn set_xattrs(me: &mut EntryFields<'_>, dst: &Path) -> io::Result<()> {
+        async fn set_xattrs<R: Read>(me: &mut EntryFields<'_, R>, dst: &Path) -> io::Result<()> {
             use std::{ffi::OsStr, os::unix::prelude::*};
 
             let exts = match me.pax_extensions().await {
@@ -901,7 +885,7 @@ impl<'a> EntryFields<'a> {
         // Windows does not completely support posix xattrs
         // https://en.wikipedia.org/wiki/Extended_file_attributes#Windows_NT
         #[cfg(any(windows, not(feature = "xattr"), target_arch = "wasm32"))]
-        async fn set_xattrs(_: &mut EntryFields, _: &Path) -> io::Result<()> {
+        async fn set_xattrs<R: Read>(_: &mut EntryFields<'_, R>, _: &Path) -> io::Result<()> {
             Ok(())
         }
     }
@@ -955,7 +939,7 @@ impl<'a> EntryFields<'a> {
     }
 }
 
-impl<'a> Read for EntryFields<'a> {
+impl<'a, R: Read> Read for EntryFields<'a, R> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -977,7 +961,7 @@ impl<'a> Read for EntryFields<'a> {
     }
 }
 
-impl<'a> Read for EntryIo<'a> {
+impl<'a, R: Read> Read for EntryIo<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

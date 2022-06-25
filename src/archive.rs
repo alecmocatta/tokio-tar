@@ -2,7 +2,7 @@ use pin_cell::{PinCell, PinMut};
 use pin_project::pin_project;
 use std::{
     cell::Cell,
-    cmp, fs, marker,
+    cmp, fs,
     path::Path,
     pin::Pin,
     task::{Context, Poll},
@@ -41,22 +41,21 @@ pub struct ArchiveInner<R: ?Sized> {
 
 /// An iterator over the entries of an archive.
 pub struct Entries<'a, R: 'a + Read> {
-    fields: EntriesFields<'a>,
-    _ignored: marker::PhantomData<&'a Archive<R>>,
+    fields: EntriesFields<'a, R>,
 }
 
 trait SeekRead: Read + Seek {}
 impl<R: Read + Seek> SeekRead for R {}
 
-struct EntriesFields<'a> {
-    archive: Pin<&'a Archive<dyn Read + 'a>>,
-    seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
+struct EntriesFields<'a, R: 'a + Read> {
+    archive: Pin<&'a Archive<R>>,
+    // seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
     next: u64,
     done: bool,
     raw: bool,
 }
 
-impl<R: Read> Archive<R> {
+impl<R: Read + Unpin> Archive<R> {
     /// Create a new archive with the underlying object as the reader.
     pub fn new(obj: R) -> Archive<R> {
         Archive {
@@ -86,11 +85,7 @@ impl<R: Read> Archive<R> {
     /// iterator returns), then the contents read for each entry may be
     /// corrupted.
     pub fn entries(&mut self) -> io::Result<Entries<R>> {
-        let me: &mut Archive<dyn Read> = self;
-        me._entries(None).map(|fields| Entries {
-            fields,
-            _ignored: marker::PhantomData,
-        })
+        self._entries().map(|fields| Entries { fields })
     }
 
     /// Unpacks the contents tarball into the specified `dst`.
@@ -113,8 +108,7 @@ impl<R: Read> Archive<R> {
     /// ar.unpack("foo").unwrap();
     /// ```
     pub async fn unpack<P: AsRef<Path>>(&mut self, dst: P) -> io::Result<()> {
-        let me: &mut Archive<dyn Read> = self;
-        me._unpack(dst.as_ref()).await
+        self._unpack(dst.as_ref()).await
     }
 
     /// Indicate whether extended file attributes (xattrs on Unix) are preserved
@@ -166,31 +160,11 @@ impl<R: Read> Archive<R> {
     pub fn set_ignore_zeros(&mut self, ignore_zeros: bool) {
         self.inner.ignore_zeros = ignore_zeros;
     }
-}
 
-impl<R: Seek + Read> Archive<R> {
-    /// Construct an iterator over the entries in this archive for a seekable
-    /// reader. Seek will be used to efficiently skip over file contents.
-    ///
-    /// Note that care must be taken to consider each entry within an archive in
-    /// sequence. If entries are processed out of sequence (from what the
-    /// iterator returns), then the contents read for each entry may be
-    /// corrupted.
-    pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
-        let me: &Archive<dyn Read> = self;
-        let me_seekable: &Archive<dyn SeekRead> = self;
-        me._entries(Some(me_seekable)).map(|fields| Entries {
-            fields,
-            _ignored: marker::PhantomData,
-        })
-    }
-}
-
-impl Archive<dyn Read + '_> {
     fn _entries<'a>(
         &'a self,
-        seekable_archive: Option<&'a Archive<dyn SeekRead + 'a>>,
-    ) -> io::Result<EntriesFields<'a>> {
+        // seekable_archive: Option<&'a Self>,
+    ) -> io::Result<EntriesFields<'a, R>> {
         if self.inner.pos.get() != 0 {
             return Err(other(
                 "cannot call entries unless archive is at \
@@ -198,8 +172,8 @@ impl Archive<dyn Read + '_> {
             ));
         }
         Ok(EntriesFields {
-            archive: unsafe { Pin::new_unchecked(self) },
-            seekable_archive,
+            archive: Pin::new(self),
+            // seekable_archive,
             done: false,
             next: 0,
             raw: false,
@@ -223,7 +197,7 @@ impl Archive<dyn Read + '_> {
         // descendants), to ensure that directory permissions do not interfer with descendant
         // extraction.
         let mut directories = Vec::new();
-        let mut entries = self._entries(None)?;
+        let mut entries = self._entries()?;
         while let Some(entry) = entries.next().await {
             let mut file = entry.map_err(|e| TarError::new("failed to iterate over archive", e))?;
             if file.header().entry_type() == crate::EntryType::Directory {
@@ -240,6 +214,23 @@ impl Archive<dyn Read + '_> {
     }
 }
 
+// impl<R: Seek + Read> Archive<R> {
+//     /// Construct an iterator over the entries in this archive for a seekable
+//     /// reader. Seek will be used to efficiently skip over file contents.
+//     ///
+//     /// Note that care must be taken to consider each entry within an archive in
+//     /// sequence. If entries are processed out of sequence (from what the
+//     /// iterator returns), then the contents read for each entry may be
+//     /// corrupted.
+//     pub fn entries_with_seek(&mut self) -> io::Result<Entries<R>> {
+//         let me: &Archive<dyn Read> = self;
+//         let me_seekable: &Archive<dyn SeekRead> = self;
+//         me._entries(Some(me_seekable)).map(|fields| Entries {
+//             fields,
+//         })
+//     }
+// }
+
 impl<'a, R: Read> Entries<'a, R> {
     /// Indicates whether this iterator will return raw entries or not.
     ///
@@ -249,7 +240,6 @@ impl<'a, R: Read> Entries<'a, R> {
     pub fn raw(self, raw: bool) -> Entries<'a, R> {
         Entries {
             fields: EntriesFields { raw, ..self.fields },
-            _ignored: marker::PhantomData,
         }
     }
 }
@@ -262,11 +252,8 @@ impl<'a, R: Read> Entries<'a, R> {
     }
 }
 
-impl<'a> EntriesFields<'a> {
-    async fn next_entry_raw(
-        &mut self,
-        pax_size: Option<u64>,
-    ) -> io::Result<Option<Entry<'a, io::Empty>>> {
+impl<'a, R: Read> EntriesFields<'a, R> {
+    async fn next_entry_raw(&mut self, pax_size: Option<u64>) -> io::Result<Option<Entry<'a, R>>> {
         let mut header = Header::new_old();
         let mut header_pos = self.next;
         loop {
@@ -341,7 +328,7 @@ impl<'a> EntriesFields<'a> {
         Ok(Some(ret.into_entry()))
     }
 
-    async fn next_entry(&mut self) -> io::Result<Option<Entry<'a, io::Empty>>> {
+    async fn next_entry(&mut self) -> io::Result<Option<Entry<'a, R>>> {
         if self.raw {
             return self.next_entry_raw(None).await;
         }
@@ -412,7 +399,7 @@ impl<'a> EntriesFields<'a> {
         }
     }
 
-    async fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a>) -> io::Result<()> {
+    async fn parse_sparse_header(&mut self, entry: &mut EntryFields<'a, R>) -> io::Result<()> {
         if !entry.header.entry_type().is_gnu_sparse() {
             return Ok(());
         }
@@ -524,7 +511,12 @@ impl<'a> EntriesFields<'a> {
         let mut buf = [0u8; 4096 * 8];
         while amt > 0 {
             let n = cmp::min(amt, buf.len() as u64);
-            let n = self.archive.project_ref().inner.read(&mut buf[..n as usize]).await?;
+            let n = self
+                .archive
+                .project_ref()
+                .inner
+                .read(&mut buf[..n as usize])
+                .await?;
             if n == 0 {
                 return Err(other("unexpected EOF during skip"));
             }
@@ -535,8 +527,8 @@ impl<'a> EntriesFields<'a> {
     }
 }
 
-impl<'a> EntriesFields<'a> {
-    async fn next(&mut self) -> Option<io::Result<Entry<'a, io::Empty>>> {
+impl<'a, R: Read> EntriesFields<'a, R> {
+    async fn next(&mut self) -> Option<io::Result<Entry<'a, R>>> {
         if self.done {
             None
         } else {
@@ -554,22 +546,6 @@ impl<'a> EntriesFields<'a> {
         }
     }
 }
-
-// impl<'a, R: ?Sized + Read> Read for &'a ArchiveInner<R> {
-//     fn poll_read(
-//         self: Pin<&mut Self>,
-//         cx: &mut Context<'_>,
-//         into: &mut ReadBuf<'_>,
-//     ) -> Poll<Result<(), io::Error>> {
-//         let a: Pin<&&ArchiveInner<R>> = self.as_ref();
-//         let a: Pin<&ArchiveInner<R>> = unsafe { a.map_unchecked(|x| *x) };
-//         let start = into.filled().len();
-//         let ret = PinMut::as_mut(&mut a.project_ref().obj.borrow_mut()).poll_read(cx, into);
-//         let i = into.filled().len() - start;
-//         self.pos.set(self.pos.get() + i as u64);
-//         ret
-//     }
-// }
 
 impl<'a, R: ?Sized + Read> Read for Pin<&'a ArchiveInner<R>> {
     fn poll_read(
