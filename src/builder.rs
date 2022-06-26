@@ -13,14 +13,14 @@ use crate::{
 ///
 /// This structure has methods for building up an archive from scratch into any
 /// arbitrary writer.
-pub struct Builder<W: Write + Unpin + Send + Sync> {
+pub struct Builder<W: Write + Unpin> {
     mode: HeaderMode,
     follow: bool,
     finished: bool,
     obj: Option<W>,
 }
 
-impl<W: Write + Unpin + Send + Sync> Builder<W> {
+impl<W: Write + Unpin> Builder<W> {
     /// Create a new archive builder with the underlying object as the
     /// destination of all data written. The builder will use
     /// `HeaderMode::Complete` by default.
@@ -113,7 +113,7 @@ impl<W: Write + Unpin + Send + Sync> Builder<W> {
     /// #
     /// # Ok(()) }) }
     /// ```
-    pub async fn append<R: Read + Unpin + Send>(
+    pub async fn append<R: Read + Unpin>(
         &mut self,
         header: &Header,
         mut data: R,
@@ -167,7 +167,7 @@ impl<W: Write + Unpin + Send + Sync> Builder<W> {
     /// #
     /// # Ok(()) }) }
     /// ```
-    pub async fn append_data<P: AsRef<Path>, R: Read + Unpin + Send>(
+    pub async fn append_data<P: AsRef<Path>, R: Read + Unpin>(
         &mut self,
         header: &mut Header,
         path: P,
@@ -403,9 +403,9 @@ impl<W: Write + Unpin + Send + Sync> Builder<W> {
 }
 
 async fn append(
-    mut dst: &mut (dyn Write + Unpin + Send),
+    mut dst: &mut (dyn Write + Unpin),
     header: &Header,
-    mut data: &mut (dyn Read + Unpin + Send),
+    mut data: &mut (dyn Read + Unpin),
 ) -> io::Result<()> {
     dst.write_all(header.as_bytes()).await?;
     let len = io::copy(&mut data, &mut dst).await?;
@@ -421,7 +421,7 @@ async fn append(
 }
 
 async fn append_path_with_name(
-    dst: &mut (dyn Write + Unpin + Sync + Send),
+    dst: &mut (dyn Write + Unpin),
     path: &Path,
     name: Option<&Path>,
     mode: HeaderMode,
@@ -475,7 +475,7 @@ async fn append_path_with_name(
 }
 
 async fn append_file(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     path: &Path,
     file: &mut fs::File,
     mode: HeaderMode,
@@ -486,7 +486,7 @@ async fn append_file(
 }
 
 async fn append_dir(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -512,7 +512,7 @@ fn prepare_header(size: u64, entry_type: EntryType) -> Header {
 }
 
 async fn prepare_header_path(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     header: &mut Header,
     path: &Path,
 ) -> io::Result<()> {
@@ -541,7 +541,7 @@ async fn prepare_header_path(
 }
 
 async fn prepare_header_link(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     header: &mut Header,
     link_name: &Path,
 ) -> io::Result<()> {
@@ -559,10 +559,10 @@ async fn prepare_header_link(
 }
 
 async fn append_fs(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     path: &Path,
     meta: &Metadata,
-    read: &mut (dyn Read + Unpin + Sync + Send),
+    read: &mut (dyn Read + Unpin),
     mode: HeaderMode,
     link_name: Option<&Path>,
 ) -> io::Result<()> {
@@ -580,7 +580,7 @@ async fn append_fs(
 }
 
 async fn append_dir_all(
-    dst: &mut (dyn Write + Unpin + Send + Sync),
+    dst: &mut (dyn Write + Unpin),
     path: &Path,
     src_path: &Path,
     mode: HeaderMode,
@@ -612,7 +612,7 @@ async fn append_dir_all(
     Ok(())
 }
 
-impl<W: Write + Unpin + Send + Sync> Drop for Builder<W> {
+impl<W: Write + Unpin> Drop for Builder<W> {
     fn drop(&mut self) {
         // assert!(self.finished, "call fn finish() or fn into_inner() before dropping");
         // tokio::runtime::Runtime::new().unwrap().block_on(async move {
